@@ -955,6 +955,20 @@ impl Open {
         Ok(self.metadata.offset_keys())
     }
 
+    /// Returns the names among `names` that are absent from the file header.
+    ///
+    /// This is a **header-only** check: it only consults the in-memory metadata
+    /// read at open time and never reads any tensor bytes. The result preserves
+    /// the order of `names`, deduplicated (a name appearing several times is
+    /// reported at most once, at its first position).
+    pub fn missing_keys(&self, names: Vec<String>) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        names
+            .into_iter()
+            .filter(|name| seen.insert(name.clone()) && self.metadata.info(name).is_none())
+            .collect()
+    }
+
     /// Start loading tensors to the device in the background; see `safe_open.prefetch`.
     pub fn prefetch(
         &self,
@@ -1789,6 +1803,35 @@ impl safe_open {
     ///         The name of the tensors contained in that file
     pub fn keys(&self) -> PyResult<Vec<String>> {
         self.inner()?.keys()
+    }
+
+    /// Returns the requested tensor names that are absent from the file.
+    ///
+    /// Header-only: only the in-memory header is consulted, no tensor bytes are
+    /// read (not even for names that exist). Names are returned in the order
+    /// they were given, deduplicated. Use this to learn about *all* missing
+    /// keys in one go before loading; the per-key [`Self::get_tensor`] error
+    /// behavior is unchanged.
+    ///
+    /// Args:
+    ///     names (`List[str]`):
+    ///         The tensor names to check for.
+    ///
+    /// Returns:
+    ///     (`List[str]`):
+    ///         The names from `names` that are not in the file, in request order.
+    ///
+    /// Example:
+    /// ```python
+    /// from safetensors import safe_open
+    ///
+    /// with safe_open("model.safetensors", framework="np") as f:
+    ///     missing = f.missing_keys(["embedding", "lm_head"])
+    ///     if missing:
+    ///         raise KeyError(f"Missing tensors: {missing}")
+    /// ```
+    pub fn missing_keys(&self, names: Vec<String>) -> PyResult<Vec<String>> {
+        Ok(self.inner()?.missing_keys(names))
     }
 
     /// Returns a tensor's header entry without reading any data.
@@ -2928,6 +2971,14 @@ impl _safe_open_handle {
     ///         The name of the tensors contained in that file
     pub fn keys(&self) -> PyResult<Vec<String>> {
         self.inner()?.keys()
+    }
+
+    /// See [`safe_open::missing_keys`]: header-only check, no tensor bytes read.
+    ///
+    /// Returns the requested names absent from the file, in request order
+    /// (deduplicated).
+    pub fn missing_keys(&self, names: Vec<String>) -> PyResult<Vec<String>> {
+        Ok(self.inner()?.missing_keys(names))
     }
 
     /// Returns a tensor's header entry without reading any data.

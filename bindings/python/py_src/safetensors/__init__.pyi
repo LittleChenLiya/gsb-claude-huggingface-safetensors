@@ -377,6 +377,37 @@ class safe_open:
         """
         pass
 
+    def missing_keys(self, names: Sequence[str]) -> List[str]:
+        """
+        Returns the requested tensor names that are absent from the file.
+
+        Header-only: only the in-memory header is consulted, no tensor bytes
+        are read (not even for names that exist). Names are returned in the
+        order they were given, deduplicated. Use this to learn about *all*
+        missing keys in one go before loading; the per-key `get_tensor` error
+        behavior is unchanged.
+
+        Args:
+            names (`List[str]`):
+                The tensor names to check for.
+
+        Returns:
+            (`List[str]`):
+                The names from `names` that are not in the file, in request
+                order.
+
+        Example:
+        ```python
+        from safetensors import safe_open
+
+        with safe_open("model.safetensors", framework="np") as f:
+            missing = f.missing_keys(["embedding", "lm_head"])
+            if missing:
+                raise KeyError(f"Missing tensors: {missing}")
+        ```
+        """
+        pass
+
     def metadata(self):
         """
         Return the special non tensor information in the header
