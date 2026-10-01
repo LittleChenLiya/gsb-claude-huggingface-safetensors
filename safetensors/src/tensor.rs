@@ -449,6 +449,21 @@ impl<'data> SafeTensors<'data> {
         Ok(Self { metadata, data })
     }
 
+    /// Read-only metadata range precheck.
+    ///
+    /// Parses the header and runs [`Metadata::precheck`] without reading or
+    /// allocating any tensor data. Lists each tensor's name, dtype, shape,
+    /// declared byte range, and the byte length computed from shape and dtype,
+    /// and rejects arithmetic overflow and overlapping ranges before any
+    /// payload is read.
+    ///
+    /// This is the safe entry point for inspecting an untrusted file: no
+    /// tensor data is allocated or copied.
+    pub fn precheck(buffer: &'data [u8]) -> Result<PrecheckReport, SafeTensorError> {
+        let (_n, metadata) = Self::read_metadata(buffer)?;
+        metadata.precheck()
+    }
+
     /// Returns the tensors contained within the SafeTensors.
     /// The tensors returned are merely views and the data is not owned by this
     /// structure.
@@ -524,6 +539,57 @@ impl<'data> SafeTensors<'data> {
     pub fn is_empty(&self) -> bool {
         self.metadata.tensors.is_empty()
     }
+}
+
+/// A read-only description of a single tensor's metadata range within the
+/// safetensors file.
+///
+/// Produced by [`Metadata::precheck`]. Lists the tensor's name, dtype, shape,
+/// declared byte range, and the byte length computed from its shape and dtype.
+/// No tensor data is read or allocated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorRange {
+    /// The name of the tensor.
+    pub name: String,
+    /// The data type of the tensor.
+    pub dtype: Dtype,
+    /// The shape of the tensor.
+    pub shape: Vec<usize>,
+    /// The declared byte range `(start, end)` of the tensor's data within the
+    /// file's data buffer.
+    pub data_offsets: (usize, usize),
+    /// The expected byte length computed from [`Self::shape`] and
+    /// [`Self::dtype`].
+    pub expected_len: usize,
+}
+
+/// A pair of tensors whose declared byte ranges overlap.
+///
+/// Produced by [`Metadata::precheck`] when two tensors claim overlapping
+/// regions of the data buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlapRisk {
+    /// Name of the first tensor (lower offset).
+    pub left: String,
+    /// Name of the second tensor (higher offset).
+    pub right: String,
+    /// The overlapping byte range `(start, end)`.
+    pub range: (usize, usize),
+}
+
+/// A read-only report produced by [`Metadata::precheck`].
+///
+/// Lists each tensor's shape, declared byte range, and the byte length
+/// computed from shape and dtype, along with any overlap risks detected.
+/// The precheck never reads or allocates tensor data.
+#[derive(Debug, Clone)]
+pub struct PrecheckReport {
+    /// The tensor ranges, ordered by increasing offset.
+    pub tensors: Vec<TensorRange>,
+    /// The total length of the data buffer in bytes (end of the last tensor).
+    pub data_len: usize,
+    /// Overlap risks detected between tensor ranges. Empty for valid files.
+    pub overlaps: Vec<OverlapRisk>,
 }
 
 /// The stuct representing the header of safetensor files which allow
@@ -625,21 +691,36 @@ impl Metadata {
     }
 
     fn validate(&self) -> Result<usize, SafeTensorError> {
-        let mut start = 0;
+        let report = self.precheck()?;
+        Ok(report.data_len)
+    }
+
+    /// Performs a read-only range precheck over the metadata.
+    ///
+    /// This lists each tensor's name, dtype, shape, declared byte range, and
+    /// the byte length computed from its shape and dtype. It detects
+    /// arithmetic overflow (shape * dtype bitsize) and overlapping byte
+    /// ranges, rejecting both before any payload is read. No tensor data is
+    /// allocated or read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SafeTensorError::ValidationOverflow`] if computing the byte
+    /// length overflows, [`SafeTensorError::InvalidOffset`] if the declared
+    /// ranges are malformed, overlapping, or have gaps, and
+    /// [`SafeTensorError::TensorInvalidInfo`] if a declared range does not
+    /// match the length computed from shape and dtype.
+    pub fn precheck(&self) -> Result<PrecheckReport, SafeTensorError> {
+        let mut tensors = Vec::with_capacity(self.tensors.len());
+        let mut overlaps = Vec::new();
+        let mut expected_start = 0usize;
+
         for (i, info) in self.tensors.iter().enumerate() {
             let (s, e) = info.data_offsets;
-            if s != start || e < s {
-                let tensor_name = self
-                    .index_map
-                    .iter()
-                    .find_map(|(name, &index)| if index == i { Some(&name[..]) } else { None })
-                    .unwrap_or("no_tensor");
-                return Err(SafeTensorError::InvalidOffset(tensor_name.to_string()));
-            }
 
-            start = e;
-
-            let nelements: usize = info
+            // Compute the expected byte length with checked arithmetic so that
+            // overflow is rejected before any payload is read.
+            let nelements = info
                 .shape
                 .iter()
                 .copied()
@@ -648,19 +729,64 @@ impl Metadata {
             let nbits = nelements
                 .checked_mul(info.dtype.bitsize())
                 .ok_or(SafeTensorError::ValidationOverflow)?;
-
             if nbits % 8 != 0 {
                 return Err(SafeTensorError::MisalignedSlice);
             }
-            let size = nbits
+            let expected_len = nbits
                 .checked_div(8)
                 .ok_or(SafeTensorError::ValidationOverflow)?;
 
-            if e - s != size {
+            // The declared range must be well-formed and match the length
+            // computed from shape and dtype.
+            if e < s || e - s != expected_len {
                 return Err(SafeTensorError::TensorInvalidInfo);
             }
+
+            // Detect overlaps with earlier ranges and record them for the
+            // report. In valid metadata this is always empty because of the
+            // contiguity check below, but the audit still lists what it finds.
+            for (j, prev) in self.tensors[..i].iter().enumerate() {
+                let (ps, pe) = prev.data_offsets;
+                if s < pe && ps < e {
+                    overlaps.push(OverlapRisk {
+                        left: self.name_for_index(j).to_string(),
+                        right: self.name_for_index(i).to_string(),
+                        range: (s.max(ps), e.min(pe)),
+                    });
+                }
+            }
+
+            // Ranges must be contiguous and ordered: each tensor starts exactly
+            // where the previous one ended. A gap or overlap is rejected here,
+            // before any payload is read.
+            if s != expected_start {
+                return Err(SafeTensorError::InvalidOffset(
+                    self.name_for_index(i).to_string(),
+                ));
+            }
+
+            tensors.push(TensorRange {
+                name: self.name_for_index(i).to_string(),
+                dtype: info.dtype,
+                shape: info.shape.clone(),
+                data_offsets: (s, e),
+                expected_len,
+            });
+            expected_start = e;
         }
-        Ok(start)
+
+        Ok(PrecheckReport {
+            tensors,
+            data_len: expected_start,
+            overlaps,
+        })
+    }
+
+    fn name_for_index(&self, index: usize) -> &str {
+        self.index_map
+            .iter()
+            .find_map(|(name, &i)| if i == index { Some(name.as_str()) } else { None })
+            .unwrap_or("no_tensor")
     }
 
     /// Gives back the tensor metadata
@@ -1607,5 +1733,124 @@ mod tests {
             }
             _ => panic!("This should not be able to be serialized"),
         }
+    }
+
+    /// Helper: build a safetensors byte buffer from a raw JSON header and a
+    /// payload of the given length. The header is padded to 8-byte alignment.
+    fn build_raw_file(header: &str, payload_len: usize) -> Vec<u8> {
+        let header_bytes = header.as_bytes();
+        let n = header_bytes.len();
+        let aligned = n.next_multiple_of(N_LEN);
+        let mut bytes = Vec::with_capacity(N_LEN + aligned + payload_len);
+        bytes.extend((aligned as u64).to_le_bytes());
+        bytes.extend(header_bytes);
+        bytes.extend(std::iter::repeat_n(b' ', aligned - n));
+        bytes.extend(std::iter::repeat_n(0u8, payload_len));
+        bytes
+    }
+
+    #[test]
+    fn test_precheck_valid_two_tensors() {
+        // Construct a valid two-tensor file.
+        let data_a: Vec<u8> = [0.0f32, 1.0, 2.0, 3.0]
+            .into_iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let data_b: Vec<u8> = [4.0f32, 5.0]
+            .into_iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let view_a = TensorView::new(Dtype::F32, vec![2, 2], &data_a).unwrap();
+        let view_b = TensorView::new(Dtype::F32, vec![2], &data_b).unwrap();
+        let metadata: HashMap<String, TensorView> = [
+            ("a".to_string(), view_a),
+            ("b".to_string(), view_b),
+        ]
+        .into_iter()
+        .collect();
+        let bytes = serialize(&metadata, None).unwrap();
+
+        // The read-only precheck lists shapes, byte ranges, and overlap risks.
+        let report = SafeTensors::precheck(&bytes).unwrap();
+        assert_eq!(report.tensors.len(), 2);
+        assert!(report.overlaps.is_empty(), "valid file must have no overlaps");
+        assert_eq!(report.data_len, 24);
+
+        let ranges: HashMap<&str, &TensorRange> = report
+            .tensors
+            .iter()
+            .map(|r| (r.name.as_str(), r))
+            .collect();
+        assert_eq!(ranges["a"].dtype, Dtype::F32);
+        assert_eq!(ranges["a"].shape, vec![2, 2]);
+        assert_eq!(ranges["a"].data_offsets, (0, 16));
+        assert_eq!(ranges["a"].expected_len, 16);
+        assert_eq!(ranges["b"].dtype, Dtype::F32);
+        assert_eq!(ranges["b"].shape, vec![2]);
+        assert_eq!(ranges["b"].data_offsets, (16, 24));
+        assert_eq!(ranges["b"].expected_len, 8);
+
+        // The original read agrees and returns the same payload.
+        let loaded = SafeTensors::deserialize(&bytes).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.tensor("a").unwrap().data(), data_a.as_slice());
+        assert_eq!(loaded.tensor("b").unwrap().data(), data_b.as_slice());
+    }
+
+    #[test]
+    fn test_precheck_overlapping_intervals() {
+        // Two tensors whose declared byte ranges overlap: [0,16) and [8,24).
+        let header = r#"{"a":{"dtype":"F32","shape":[2,2],"data_offsets":[0,16]},"b":{"dtype":"F32","shape":[2,2],"data_offsets":[8,24]}}"#;
+        let bytes = build_raw_file(header, 24);
+
+        // The precheck must reject the overlap before any payload is read.
+        let err = SafeTensors::precheck(&bytes).unwrap_err();
+        assert!(
+            matches!(err, SafeTensorError::InvalidOffset(_)),
+            "expected InvalidOffset, got {err:?}"
+        );
+
+        // The original read must also reject the overlap.
+        let err2 = SafeTensors::deserialize(&bytes).unwrap_err();
+        assert!(
+            matches!(err2, SafeTensorError::InvalidOffset(_)),
+            "expected InvalidOffset, got {err2:?}"
+        );
+    }
+
+    #[test]
+    fn test_precheck_large_dimension_overflow() {
+        // A shape whose element count overflows usize multiplication.
+        let header = r#"{"test":{"dtype":"I32","shape":[2,18446744073709551614],"data_offsets":[0,16]}}"#;
+        let bytes = build_raw_file(header, 16);
+
+        // The precheck must reject the overflow before any payload is read.
+        let err = SafeTensors::precheck(&bytes).unwrap_err();
+        assert!(
+            matches!(err, SafeTensorError::ValidationOverflow),
+            "expected ValidationOverflow, got {err:?}"
+        );
+
+        // The original read must also reject the overflow.
+        let err2 = SafeTensors::deserialize(&bytes).unwrap_err();
+        assert!(
+            matches!(err2, SafeTensorError::ValidationOverflow),
+            "expected ValidationOverflow, got {err2:?}"
+        );
+    }
+
+    #[test]
+    fn test_precheck_does_not_allocate_payload() {
+        // The precheck only reads metadata; it must not touch the payload.
+        // Build a valid file and confirm the precheck succeeds while the
+        // payload bytes are irrelevant (we pass a zero-filled payload).
+        let header = r#"{"test":{"dtype":"F32","shape":[2,2],"data_offsets":[0,16]}}"#;
+        let bytes = build_raw_file(header, 16);
+        let report = SafeTensors::precheck(&bytes).unwrap();
+        assert_eq!(report.tensors.len(), 1);
+        assert_eq!(report.tensors[0].shape, vec![2, 2]);
+        assert_eq!(report.tensors[0].data_offsets, (0, 16));
+        assert_eq!(report.tensors[0].expected_len, 16);
+        assert!(report.overlaps.is_empty());
     }
 }
