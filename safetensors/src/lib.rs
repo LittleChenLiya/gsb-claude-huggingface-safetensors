@@ -7,6 +7,9 @@ pub mod tensor;
 #[cfg(feature = "std")]
 pub use tensor::serialize_to_file;
 pub use tensor::{serialize, Dtype, SafeTensorError, SafeTensors, View};
+pub use slice::{
+    SignedIndexer, SliceBoundary, SliceBoundaryReport, SliceByteRanges, SlicedShape,
+};
 
 #[cfg(not(feature = "std"))]
 #[macro_use]

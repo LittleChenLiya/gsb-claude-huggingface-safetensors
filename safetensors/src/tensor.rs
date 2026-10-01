@@ -790,6 +790,21 @@ impl<'data> TensorView<'data> {
     ) -> Result<SliceIterator<'data>, InvalidSlice> {
         SliceIterator::new(self, slices)
     }
+
+    /// Compute the [`SliceBoundaryReport`] for a slicing operation without
+    /// reading or copying the underlying data buffer.
+    ///
+    /// The report carries, for every dimension, the actual cropped
+    /// half-open interval `[start, stop)` the slice resolved to and whether
+    /// the slice is empty. It follows the same indexing semantics as
+    /// [`TensorView::sliced_data`]: out-of-bounds indices are rejected, not
+    /// clamped.
+    pub fn slice_boundaries(
+        &self,
+        slices: &[TensorIndexer],
+    ) -> Result<crate::slice::SliceBoundaryReport, InvalidSlice> {
+        crate::slice::slice_boundaries(self.shape(), slices)
+    }
 }
 
 /// A single tensor information.
