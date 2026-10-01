@@ -6,7 +6,9 @@ pub mod tensor;
 /// serialize_to_file only valid in std
 #[cfg(feature = "std")]
 pub use tensor::serialize_to_file;
-pub use tensor::{serialize, Dtype, SafeTensorError, SafeTensors, View};
+pub use tensor::{
+    serialize, Dtype, PreflightReport, SafeTensorError, SafeTensors, TensorRange, View,
+};
 
 #[cfg(not(feature = "std"))]
 #[macro_use]

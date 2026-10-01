@@ -47,6 +47,11 @@ pub enum SafeTensorError {
     /// For smaller than 1 byte dtypes, some slices will happen outside of the byte boundary, some special care has to be taken
     /// and standard functions will fail
     MisalignedSlice,
+    /// Two or more tensors declare byte ranges that overlap each other.
+    /// The metadata range preflight rejects such files before any tensor
+    /// payload is read. The contained message lists the overlapping tensors
+    /// and their byte ranges.
+    TensorOverlap(String),
 }
 
 #[cfg(feature = "std")]
@@ -87,7 +92,8 @@ impl Display for SafeTensorError {
             }
             MetadataIncompleteBuffer => write!(f, "incomplete metadata, file not fully covered"),
             ValidationOverflow => write!(f, "overflow computing buffer size from shape and/or element type"),
-            MisalignedSlice => write!(f, "The slice is slicing for subbytes dtypes, and the slice does not end up at a byte boundary, this is invalid.")
+            MisalignedSlice => write!(f, "The slice is slicing for subbytes dtypes, and the slice does not end up at a byte boundary, this is invalid."),
+            TensorOverlap(info) => write!(f, "overlapping tensor byte ranges: {info}"),
         }
     }
 }
@@ -384,44 +390,90 @@ pub struct SafeTensors<'data> {
     data: &'data [u8],
 }
 
+/// Parses the 8-byte length prefix and the JSON header of a safetensors
+/// buffer, returning the header size `n` and the raw (not yet validated)
+/// metadata. This never touches the tensor payload.
+fn read_header(buffer: &[u8]) -> Result<(usize, HashMetadata), SafeTensorError> {
+    let Some(header_size_bytes) = buffer.get(..N_LEN) else {
+        return Err(SafeTensorError::HeaderTooSmall);
+    };
+    let arr: [u8; N_LEN] = header_size_bytes
+        .try_into()
+        .expect("this can't fail due to how `header_size_bytes` is defined above");
+    let n: usize = u64::from_le_bytes(arr)
+        .try_into()
+        .map_err(|_| SafeTensorError::HeaderTooLarge)?;
+
+    if n > MAX_HEADER_SIZE {
+        return Err(SafeTensorError::HeaderTooLarge);
+    }
+
+    let stop = n
+        .checked_add(N_LEN)
+        .ok_or(SafeTensorError::InvalidHeaderLength)?;
+
+    // the `.get(start..stop)` returns None if either index is out of bounds,
+    // so this implicitly also ensures that `stop <= buffer.len()`.
+    let Some(header_bytes) = buffer.get(N_LEN..stop) else {
+        return Err(SafeTensorError::InvalidHeaderLength);
+    };
+    let string = core::str::from_utf8(header_bytes).map_err(SafeTensorError::InvalidHeader)?;
+    let metadata: HashMetadata =
+        serde_json::from_str(string).map_err(SafeTensorError::InvalidHeaderDeserialization)?;
+    Ok((n, metadata))
+}
+
 impl<'data> SafeTensors<'data> {
     /// Given a byte-buffer representing the whole safetensor file
     /// parses the header, and returns the size of the header + the parsed data.
     pub fn read_metadata(buffer: &'data [u8]) -> Result<(usize, Metadata), SafeTensorError> {
         let buffer_len = buffer.len();
-        let Some(header_size_bytes) = buffer.get(..N_LEN) else {
-            return Err(SafeTensorError::HeaderTooSmall);
-        };
-        let arr: [u8; N_LEN] = header_size_bytes
-            .try_into()
-            .expect("this can't fail due to how `header_size_bytes` is defined above");
-        let n: usize = u64::from_le_bytes(arr)
-            .try_into()
-            .map_err(|_| SafeTensorError::HeaderTooLarge)?;
-
-        if n > MAX_HEADER_SIZE {
-            return Err(SafeTensorError::HeaderTooLarge);
-        }
-
-        let stop = n
-            .checked_add(N_LEN)
-            .ok_or(SafeTensorError::InvalidHeaderLength)?;
-
-        // the `.get(start..stop)` returns None if either index is out of bounds,
-        // so this implicitly also ensures that `stop <= buffer.len()`.
-        let Some(header_bytes) = buffer.get(N_LEN..stop) else {
-            return Err(SafeTensorError::InvalidHeaderLength);
-        };
-        let string = core::str::from_utf8(header_bytes).map_err(SafeTensorError::InvalidHeader)?;
-        let metadata: HashMetadata =
-            serde_json::from_str(string).map_err(SafeTensorError::InvalidHeaderDeserialization)?;
-        let metadata: Metadata = metadata.try_into()?;
+        let (n, hash_metadata) = read_header(buffer)?;
+        let metadata: Metadata = hash_metadata.try_into()?;
         let buffer_end = metadata.validate()?;
         if buffer_end + N_LEN + n != buffer_len {
             return Err(SafeTensorError::MetadataIncompleteBuffer);
         }
 
         Ok((n, metadata))
+    }
+
+    /// Performs a read-only preflight check of the tensor metadata ranges.
+    ///
+    /// This parses only the 8-byte length prefix and the JSON header of
+    /// `buffer`; it never reads, slices, or allocates any tensor payload
+    /// data. It returns a [`PreflightReport`] listing, for every tensor, its
+    /// shape and its byte range within the payload.
+    ///
+    /// Files with arithmetic overflow in `shape * dtype`, with byte ranges
+    /// not matching `shape * dtype`, with gaps, or with **overlapping** byte
+    /// ranges are rejected (respectively with [`SafeTensorError::ValidationOverflow`],
+    /// [`SafeTensorError::TensorInvalidInfo`], [`SafeTensorError::InvalidOffset`],
+    /// and [`SafeTensorError::TensorOverlap`]) *before* the payload is ever
+    /// touched, so a successful report guarantees the tensor ranges are
+    /// consistent, contiguous, and overlap-free.
+    ///
+    /// ```
+    /// use safetensors::SafeTensors;
+    ///
+    /// let serialized = b"<\x00\x00\x00\x00\x00\x00\x00{\"test\":{\"dtype\":\"I32\",\"shape\":[2,2],\"data_offsets\":[0,16]}}\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+    /// let report = SafeTensors::preflight_metadata(serialized).unwrap();
+    /// assert_eq!(report.tensors.len(), 1);
+    /// assert_eq!(report.tensors[0].name, "test");
+    /// assert_eq!(report.tensors[0].shape, vec![2, 2]);
+    /// assert_eq!(report.tensors[0].data_offsets, (0, 16));
+    /// ```
+    pub fn preflight_metadata(buffer: &[u8]) -> Result<PreflightReport, SafeTensorError> {
+        let (n, hash_metadata) = read_header(buffer)?;
+        let report = PreflightReport::from_header(n, hash_metadata)?;
+        let expected_len = report
+            .data_start
+            .checked_add(report.data_len)
+            .ok_or(SafeTensorError::MetadataIncompleteBuffer)?;
+        if expected_len != buffer.len() {
+            return Err(SafeTensorError::MetadataIncompleteBuffer);
+        }
+        Ok(report)
     }
 
     /// Given a byte-buffer representing the whole safetensor file
@@ -523,6 +575,141 @@ impl<'data> SafeTensors<'data> {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.metadata.tensors.is_empty()
+    }
+}
+
+/// A single tensor entry of a [`PreflightReport`].
+///
+/// Describes where one tensor lives within the payload byte-buffer without
+/// exposing (or allocating) any of the tensor data itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorRange {
+    /// The name of the tensor.
+    pub name: String,
+    /// The dtype of the tensor.
+    pub dtype: Dtype,
+    /// The declared shape of the tensor.
+    pub shape: Vec<usize>,
+    /// The declared byte range of the tensor, relative to the start of the
+    /// payload (i.e. relative to the end of the JSON header).
+    pub data_offsets: (usize, usize),
+    /// The number of payload bytes this tensor occupies, recomputed from
+    /// `shape` and `dtype` with checked arithmetic. Always equals
+    /// `data_offsets.1 - data_offsets.0` for a validated report.
+    pub byte_len: usize,
+}
+
+/// Read-only report produced by [`SafeTensors::preflight_metadata`].
+///
+/// Lists the shape and byte range of every tensor in the file, together with
+/// the header size and the total payload span. A report is only ever
+/// returned once overflow, gap, and overlap risks have been ruled out, so
+/// the ranges it contains are guaranteed to be consistent, contiguous, and
+/// overlap-free.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreflightReport {
+    /// Size in bytes of the JSON header (the `n` value stored in the 8-byte
+    /// length prefix).
+    pub header_size: usize,
+    /// Absolute offset within the file at which the tensor payload starts
+    /// (`8 + header_size`).
+    pub data_start: usize,
+    /// Total number of payload bytes covered by the tensors.
+    pub data_len: usize,
+    /// One entry per tensor, sorted by increasing `data_offsets`.
+    pub tensors: Vec<TensorRange>,
+}
+
+impl PreflightReport {
+    /// Builds a report from the raw parsed header, validating every tensor
+    /// range with checked arithmetic. Rejects overflow, misaligned sub-byte
+    /// dtypes, shape/range mismatches, gaps, and overlapping ranges.
+    fn from_header(
+        header_size: usize,
+        hash_metadata: HashMetadata,
+    ) -> Result<Self, SafeTensorError> {
+        let mut tensors: Vec<(String, TensorInfo)> = hash_metadata.tensors.into_iter().collect();
+        // Sort by offsets so ranges can be checked sequentially, the same way
+        // the regular reader does.
+        tensors.sort_by_key(|(_, info)| info.data_offsets);
+
+        let mut ranges = Vec::with_capacity(tensors.len());
+        // End of the furthest-reaching tensor seen so far.
+        let mut covered = 0usize;
+        // Name and range of the tensor reaching `covered`, for diagnostics.
+        let mut previous: Option<(String, (usize, usize))> = None;
+        let mut overlaps: Vec<String> = Vec::new();
+
+        for (name, info) in tensors {
+            let (s, e) = info.data_offsets;
+            if e < s {
+                return Err(SafeTensorError::InvalidOffset(name));
+            }
+
+            let nelements: usize = info
+                .shape
+                .iter()
+                .copied()
+                .try_fold(1usize, usize::checked_mul)
+                .ok_or(SafeTensorError::ValidationOverflow)?;
+            let nbits = nelements
+                .checked_mul(info.dtype.bitsize())
+                .ok_or(SafeTensorError::ValidationOverflow)?;
+            if nbits % 8 != 0 {
+                return Err(SafeTensorError::MisalignedSlice);
+            }
+            let byte_len = nbits / 8;
+            if e - s != byte_len {
+                return Err(SafeTensorError::TensorInvalidInfo);
+            }
+
+            if s < covered {
+                // Overlapping byte ranges: record the risk so the error can
+                // list every overlapping pair, and keep scanning.
+                let (prev_name, prev_offsets) = previous
+                    .as_ref()
+                    .expect("`covered` is non-zero only after a tensor was seen");
+                overlaps.push(format!(
+                    "tensor `{name}` byte range [{s}, {e}) overlaps tensor `{prev_name}` byte range [{}, {})",
+                    prev_offsets.0, prev_offsets.1
+                ));
+            } else if s > covered {
+                // Gap: payload bytes between `covered` and `s` belong to no
+                // tensor, which the reader rejects as an invalid offset.
+                return Err(SafeTensorError::InvalidOffset(name));
+            }
+
+            if e > covered {
+                covered = e;
+                previous = Some((name.clone(), (s, e)));
+            }
+
+            ranges.push(TensorRange {
+                name,
+                dtype: info.dtype,
+                shape: info.shape,
+                data_offsets: (s, e),
+                byte_len,
+            });
+        }
+
+        if !overlaps.is_empty() {
+            let mut message = String::new();
+            for (i, overlap) in overlaps.iter().enumerate() {
+                if i > 0 {
+                    message.push_str("; ");
+                }
+                message.push_str(overlap);
+            }
+            return Err(SafeTensorError::TensorOverlap(message));
+        }
+
+        Ok(Self {
+            header_size,
+            data_start: N_LEN + header_size,
+            data_len: covered,
+            tensors: ranges,
+        })
     }
 }
 
@@ -1606,6 +1793,149 @@ mod tests {
                 // Yes we have the correct error
             }
             _ => panic!("This should not be able to be serialized"),
+        }
+    }
+
+    /// Builds a raw safetensors buffer from a JSON header and a payload.
+    fn raw_file(header: &str, payload: &[u8]) -> Vec<u8> {
+        let mut buffer = Vec::with_capacity(N_LEN + header.len() + payload.len());
+        buffer.extend((header.len() as u64).to_le_bytes());
+        buffer.extend(header.as_bytes());
+        buffer.extend(payload);
+        buffer
+    }
+
+    /// A valid file holding two tensors: `a` (F32, [2, 2]) and `b` (U8, [4, 2]).
+    fn two_tensor_buffer() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let data_a: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0]
+            .into_iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let data_b: Vec<u8> = (0u8..8).collect();
+        let view_a = TensorView::new(Dtype::F32, vec![2, 2], &data_a).unwrap();
+        let view_b = TensorView::new(Dtype::U8, vec![4, 2], &data_b).unwrap();
+        let tensors: HashMap<String, TensorView> =
+            [("a".to_string(), view_a), ("b".to_string(), view_b)]
+                .into_iter()
+                .collect();
+        let buffer = serialize(&tensors, None).unwrap();
+        (buffer, data_a, data_b)
+    }
+
+    #[test]
+    fn test_preflight_valid_two_tensors() {
+        let (buffer, data_a, data_b) = two_tensor_buffer();
+
+        let report = SafeTensors::preflight_metadata(&buffer).unwrap();
+
+        // The payload starts right after the 8-byte length prefix + header,
+        // and the tensors cover the payload exactly.
+        assert_eq!(report.data_start, N_LEN + report.header_size);
+        assert_eq!(report.data_start + report.data_len, buffer.len());
+        assert_eq!(report.data_len, 24);
+
+        // The report lists every tensor, sorted by byte range, with shapes,
+        // byte ranges, and recomputed byte lengths.
+        assert_eq!(report.tensors.len(), 2);
+        let a = &report.tensors[0];
+        assert_eq!(a.name, "a");
+        assert_eq!(a.dtype, Dtype::F32);
+        assert_eq!(a.shape, vec![2, 2]);
+        assert_eq!(a.data_offsets, (0, 16));
+        assert_eq!(a.byte_len, 16);
+        let b = &report.tensors[1];
+        assert_eq!(b.name, "b");
+        assert_eq!(b.dtype, Dtype::U8);
+        assert_eq!(b.shape, vec![4, 2]);
+        assert_eq!(b.data_offsets, (16, 24));
+        assert_eq!(b.byte_len, 8);
+
+        // Cross-check the preflight report against the regular reader: every
+        // listed range must match the tensor the reader materializes.
+        let loaded = SafeTensors::deserialize(&buffer).unwrap();
+        assert_eq!(loaded.len(), report.tensors.len());
+        for range in &report.tensors {
+            let tensor = loaded.tensor(&range.name).unwrap();
+            assert_eq!(tensor.dtype(), range.dtype);
+            assert_eq!(tensor.shape(), range.shape.as_slice());
+            assert_eq!(tensor.data().len(), range.byte_len);
+            let (s, e) = range.data_offsets;
+            assert_eq!(
+                tensor.data(),
+                &buffer[report.data_start + s..report.data_start + e]
+            );
+        }
+        assert_eq!(loaded.tensor("a").unwrap().data(), data_a.as_slice());
+        assert_eq!(loaded.tensor("b").unwrap().data(), data_b.as_slice());
+    }
+
+    #[test]
+    fn test_preflight_overlap_rejected_before_payload() {
+        // `b` starts 8 bytes before `a` ends: the byte ranges overlap.
+        let header = r#"{"a":{"dtype":"F32","shape":[2,2],"data_offsets":[0,16]},"b":{"dtype":"F32","shape":[2,2],"data_offsets":[8,24]}}"#;
+        let buffer = raw_file(header, &[0u8; 24]);
+
+        // The preflight check rejects the file while only looking at the
+        // header, i.e. before any payload byte is read or allocated, and the
+        // error lists the overlapping tensors with their byte ranges.
+        match SafeTensors::preflight_metadata(&buffer) {
+            Err(SafeTensorError::TensorOverlap(info)) => {
+                assert!(info.contains("`a`"), "unexpected message: {info}");
+                assert!(info.contains("`b`"), "unexpected message: {info}");
+                assert!(info.contains("[0, 16)"), "unexpected message: {info}");
+                assert!(info.contains("[8, 24)"), "unexpected message: {info}");
+            }
+            other => panic!("expected TensorOverlap, got {other:?}"),
+        }
+
+        // The regular reader rejects the same file too (as a generic invalid
+        // offset), confirming preflight and reader agree.
+        assert!(matches!(
+            SafeTensors::deserialize(&buffer),
+            Err(SafeTensorError::InvalidOffset(_))
+        ));
+    }
+
+    #[test]
+    fn test_preflight_gap_matches_reader() {
+        // 8 unaccounted payload bytes sit between `a` (ends at 16) and `b`
+        // (starts at 24).
+        let header = r#"{"a":{"dtype":"F32","shape":[2,2],"data_offsets":[0,16]},"b":{"dtype":"F32","shape":[2,2],"data_offsets":[24,40]}}"#;
+        let buffer = raw_file(header, &[0u8; 40]);
+
+        assert!(matches!(
+            SafeTensors::preflight_metadata(&buffer),
+            Err(SafeTensorError::InvalidOffset(name)) if name == "b"
+        ));
+        // The regular reader agrees with the preflight check.
+        assert!(matches!(
+            SafeTensors::deserialize(&buffer),
+            Err(SafeTensorError::InvalidOffset(_))
+        ));
+    }
+
+    #[test]
+    fn test_preflight_huge_dimension_overflow() {
+        // Extremely large dimensions must overflow the checked
+        // `shape * dtype` computation and be rejected before the payload is
+        // ever touched.
+        let headers = [
+            // Overflows the element count itself: 2 * (u64::MAX - 1).
+            r#"{"test":{"dtype":"I32","shape":[2,18446744073709551614],"data_offsets":[0,16]}}"#,
+            // Overflows element count * dtype bitsize.
+            r#"{"test":{"dtype":"I32","shape":[2,9223372036854775807],"data_offsets":[0,16]}}"#,
+        ];
+        for header in headers {
+            let buffer = raw_file(header, &[0u8; 16]);
+            assert!(matches!(
+                SafeTensors::preflight_metadata(&buffer),
+                Err(SafeTensorError::ValidationOverflow)
+            ));
+            // The regular reader agrees with the preflight check.
+            assert!(matches!(
+                SafeTensors::deserialize(&buffer),
+                Err(SafeTensorError::ValidationOverflow)
+            ));
         }
     }
 }
