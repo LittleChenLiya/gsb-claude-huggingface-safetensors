@@ -6,6 +6,8 @@
 #   - type annotations on `TensorSpec` / `serialize` / `serialize_file`
 #   - the `prefetch` method on `safe_open` and the `PrefetchLoader` class
 #   - the `PrefetchPlan` alias and the `TensorMeta` / `PySafeSlice` classes
+#   - the `missing_keys` method and the requested-keys form of `get_tensors`
+#     (`names` / `strict`) on the hand-written Python `safe_open` wrapper
 #
 # TODO: once we upgrade pyo3 to >= 0.28, replace `stub.py` with a dedicated
 # `tools/stub-gen` binary using `pyo3-introspection`,
@@ -13,7 +15,7 @@
 # That generator emits typed stubs directly from Rust
 # signatures — no hand-editing, no drift.
 import os
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
 
 PrefetchPlan = Dict[str, Optional[slice]]
 
@@ -332,28 +334,60 @@ class safe_open:
         """
         pass
 
-    def get_tensors(self):
+    def get_tensors(self, names: Optional[Iterable[str]] = None, *, strict: bool = ...):
         """
-        Returns every tensor in the file as a dict keyed by name.
+        Returns tensors from the file, optionally restricted to `names`.
 
-        Equivalent to iterating `offset_keys()` and calling `get_tensor` on
-        each, but specific `framework` + `device` combinations take an internal
-        fast path. On Apple-silicon MPS with PyTorch and the `"pread"` backend,
-        it bulk-allocates shared `MTLBuffer`s, fills them with parallel
-        `pread(2)`, and hands them to torch via DLPack with no extra copy.
+        With `names=None` (the default) returns every tensor in the file as a
+        dict keyed by name, like the native handle (specific `framework` +
+        `device` combinations take an internal fast path).
+
+        With `names` given and `strict=True` (the default), returns a dict of
+        the requested tensors; a name missing from the file raises, exactly as
+        `get_tensor` would (backward compatible, per-key error).
+
+        With `names` given and `strict=False`, returns a
+        `(tensors, missing_keys)` pair instead of raising. The missing list is
+        built from the header only: no tensor bytes are read to find missing
+        keys, and only the requested tensors that exist are read.
+
+        Args:
+            names (`Iterable[str]`, *optional*):
+                Names of the tensors to return; `None` returns every tensor.
+            strict (`bool`, defaults to `True`):
+                Raise on the first missing key (`True`) or return the missing
+                names alongside the tensors (`False`).
 
         Returns:
-            (`Dict[str, Tensor]`):
-                A dict of all tensors in the file.
+            (`Dict[str, Tensor]` or `(Dict[str, Tensor], List[str])`):
+                The requested tensors, or `(tensors, missing_keys)` when
+                `strict=False`.
 
         Example:
         ```python
         from safetensors import safe_open
 
-        with safe_open("model.safetensors", framework="pt", device="mps", backend="pread") as f:
-            state_dict = f.get_tensors()
+        with safe_open("model.safetensors", framework="pt") as f:
+            tensors, missing = f.get_tensors(["embedding", "head"], strict=False)
 
         ```
+        """
+        pass
+
+    def missing_keys(self, names: Iterable[str]) -> List[str]:
+        """
+        Returns the requested names the file does not contain, in one call.
+
+        Only the header is consulted, so no tensor bytes are read to list
+        missing keys. Order and duplicates follow `names`.
+
+        Args:
+            names (`Iterable[str]`):
+                The tensor names you are looking for.
+
+        Returns:
+            (`List[str]`):
+                The names from `names` that are absent from the file.
         """
         pass
 
