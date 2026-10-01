@@ -88,6 +88,71 @@ def _find_shared_tensors(state_dict: Dict[str, torch.Tensor]) -> List[Set[str]]:
     return tensors
 
 
+def find_storage_conflicts(
+    state_dict: Dict[str, torch.Tensor],
+) -> List[List[str]]:
+    """
+    Diagnose key name conflicts before saving weights: return the groups of
+    tensor names whose tensors share the *same underlying storage* (and whose
+    memory ranges actually overlap). Each returned group is a storage-sharing
+    conflict group that safetensors cannot save as-is (it would duplicate the
+    memory on disk and silently break the sharing on load).
+
+    This is a pure, read-only diagnostic:
+
+        - it never modifies `state_dict` (no keys are removed or reassigned),
+        - it never modifies the tensors themselves (no `.contiguous()`,
+          `.clone()`, resize or any in-place operation);
+        - it does not perform any I/O and never raises about conflicts.
+
+    Tensors living on the `meta` device, tensors with no allocated storage
+    (`data_ptr() == 0`) and empty tensors are ignored, exactly as they are
+    when saving. Independent tensors (distinct storages or disjoint slices of
+    a common storage) never appear in the result; duplicate aliases of the
+    very same tensor are reported together.
+
+    Args:
+        state_dict (`Dict[str, torch.Tensor]`):
+            The mapping of tensor names to tensors that is about to be saved.
+
+    Returns:
+        `List[List[str]]`:
+            The conflict groups. Each inner list contains the names of tensors
+            that overlap in memory. Groups and names inside each group are
+            sorted, so the result is deterministic and directly comparable in
+            tests. An empty list means no conflict was found.
+
+    Example:
+
+    ```python
+    from safetensors.torch import find_storage_conflicts, save_file
+
+    base = torch.zeros((4,))
+    tensors = {"a": base, "b": base[:2], "c": torch.zeros((3,))}
+    conflicts = find_storage_conflicts(tensors)
+    assert conflicts == [["a", "b"]]
+    ```
+    """
+    conflicts = []
+    for shared in _find_shared_tensors(state_dict):
+        if len(shared) > 1:
+            conflicts.append(sorted(shared))
+    conflicts.sort()
+    return conflicts
+
+
+def format_storage_conflicts(conflicts: List[List[str]]) -> str:
+    """
+    Render the conflict groups returned by
+    [`find_storage_conflicts`](#safetensors.torch.find_storage_conflicts) as a
+    human-readable, one-line-per-group diagnostic string.
+    """
+    return "\n".join(
+        "  - Tensors sharing storage: " + ", ".join(f"`{name}`" for name in group)
+        for group in conflicts
+    )
+
+
 def _is_complete(tensor: torch.Tensor) -> bool:
     return tensor.data_ptr() == storage_ptr(tensor) and tensor.nelement() * _SIZE[
         tensor.dtype
@@ -547,6 +612,8 @@ def _evaluate_tensors_for_save(tensors: Dict[str, torch.Tensor]) -> None:
             " make a much larger file than needed."
         )
 
+    # Read-only diagnosis of key name conflicts (tensors sharing storage).
+    # This does not mutate `tensors` or any underlying tensor.
     shared_pointers = _find_shared_tensors(tensors)
     failing = []
     for names in shared_pointers:
@@ -554,13 +621,19 @@ def _evaluate_tensors_for_save(tensors: Dict[str, torch.Tensor]) -> None:
             failing.append(names)
 
     if failing:
-        raise RuntimeError(
+        # Deterministic, sorted view of the same conflict groups, exposed for
+        # programmatic consumption (e.g. logging) without altering the
+        # historical error message below.
+        conflicts = sorted(sorted(names) for names in failing)
+        error = RuntimeError(
             f"""
             Some tensors share memory, this will lead to duplicate memory on disk and potential differences when loading them again: {failing}.
             A potential way to correctly save your model is to use `save_model`.
             More information at https://huggingface.co/docs/safetensors/torch_shared_tensors
             """
         )
+        error.conflict_groups = conflicts
+        raise error
 
 
 def _flatten_as_ptr(
