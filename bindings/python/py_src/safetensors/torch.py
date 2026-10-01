@@ -88,6 +88,52 @@ def _find_shared_tensors(state_dict: Dict[str, torch.Tensor]) -> List[Set[str]]:
     return tensors
 
 
+def diagnose_key_conflicts(
+    tensors: Dict[str, torch.Tensor],
+) -> List[Set[str]]:
+    """
+    Diagnose key-name conflicts before saving model weights.
+
+    Returns the list of *conflict groups*: sets of keys whose tensors share
+    the same underlying storage. This includes duplicate aliases (the exact
+    same :class:`torch.Tensor` object registered under several keys) as well
+    as overlapping views of a shared storage. Views that share storage but do
+    not actually overlap are reported separately, since they do not collide
+    on disk.
+
+    The diagnosis is purely read-only: it only inspects the tensors' storage
+    pointers and sizes, it never modifies the tensors (nor their storage) in
+    any way.
+
+    Args:
+        tensors (`Dict[str, torch.Tensor]`):
+            The incoming tensors, typically a model state dict.
+
+    Returns:
+        `List[Set[str]]`: the conflict groups, each containing at least two
+        keys sharing storage. An empty list means no conflict was detected.
+
+    Example:
+
+    ```python
+    from safetensors.torch import diagnose_key_conflicts
+    import torch
+
+    storage = torch.zeros((4, 4))
+    state_dict = {
+        "shared_a": storage,
+        "shared_b": storage[:1, :],  # view of the same storage
+        "independent": torch.zeros((3, 3)),
+        "alias_a": (alias := torch.ones(5)),
+        "alias_b": alias,  # duplicate alias of the exact same tensor
+    }
+    diagnose_key_conflicts(state_dict)
+    # [{"shared_a", "shared_b"}, {"alias_a", "alias_b"}]
+    ```
+    """
+    return [set(group) for group in _find_shared_tensors(tensors) if len(group) > 1]
+
+
 def _is_complete(tensor: torch.Tensor) -> bool:
     return tensor.data_ptr() == storage_ptr(tensor) and tensor.nelement() * _SIZE[
         tensor.dtype
@@ -170,7 +216,18 @@ def save_model(
             was chosen specifically for that reason.
     """
     state_dict = model.state_dict()
-    to_removes = _remove_duplicate_names(state_dict)
+    # Diagnose key-name conflicts (shared storage groups) before saving.
+    # This is purely read-only: it never modifies the model or its tensors.
+    conflicts = diagnose_key_conflicts(state_dict)
+    try:
+        to_removes = _remove_duplicate_names(state_dict)
+    except RuntimeError as e:
+        raise RuntimeError(
+            "Unable to save model: some keys share storage but no tensor covers the full storage,"
+            " so no key can be kept.\n"
+            f"Detected shared-storage conflict groups: {sorted(sorted(group) for group in conflicts)}\n"
+            f"Original error: {e}"
+        ) from e
 
     for kept_name, to_remove_group in to_removes.items():
         for to_remove in to_remove_group:
@@ -547,11 +604,10 @@ def _evaluate_tensors_for_save(tensors: Dict[str, torch.Tensor]) -> None:
             " make a much larger file than needed."
         )
 
-    shared_pointers = _find_shared_tensors(tensors)
-    failing = []
-    for names in shared_pointers:
-        if len(names) > 1:
-            failing.append(names)
+    # Read-only diagnosis: groups of keys sharing storage (incl. duplicate
+    # aliases). The error message below is kept identical to the historical
+    # default save failure.
+    failing = diagnose_key_conflicts(tensors)
 
     if failing:
         raise RuntimeError(
